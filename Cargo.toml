@@ -1,0 +1,10 @@
+[package]
+name = "serial_packet"
+version = "0.1.0"
+authors = ["Greg Green <gpgreen@gmail.com>"]
+edition = "2018"
+license = "GPL-3.0"
+
+[dependencies]
+heapless = "0.4.4"
+machine = "^0.2"
