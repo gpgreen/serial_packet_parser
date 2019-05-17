@@ -5,14 +5,6 @@
 //! This crate defines a SerialPacketParser that will receive a byte at a time and
 //! parse serial packets from the stream
 
-extern crate heapless;
-use heapless::consts::*;
-use heapless::Vec;
-
-const CONFIG_ARRAY_SIZE: u8 = 64;
-const DATA_ARRAY_SIZE: u8 = 60;
-const COMMAND_COUNT: u8 = 12;
-
 // Incoming Packet Bytes
 //  Header
 // |0|1|1|1|0|0|1|1| = 's'
@@ -32,6 +24,18 @@ const COMMAND_COUNT: u8 = 12;
 //  Checksum
 // |0|0|0|0|0|0|0|0| = first byte of checksum
 // |0|0|0|0|0|0|0|0| = second byte of checksum
+
+extern crate heapless;
+use heapless::consts::*;
+use heapless::Vec;
+
+#[macro_use]
+extern crate machine;
+
+// constants for address range sizes
+const CONFIG_ARRAY_SIZE: u8 = 64;
+const DATA_ARRAY_SIZE: u8 = 60;
+const COMMAND_COUNT: u8 = 12;
 
 // MCU memory rep of a serial packet
 // real packets don't have a datalen member
@@ -74,9 +78,6 @@ pub enum PacketHeaderBytes {
     N,
     P,
 }
-
-#[macro_use]
-extern crate machine;
 
 //https://github.com/rust-bakery/machine
 
