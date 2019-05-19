@@ -1,5 +1,5 @@
 [package]
-name = "serial_packet"
+name = "serial_packet_parser"
 version = "0.1.0"
 authors = ["Greg Green <gpgreen@gmail.com>"]
 edition = "2018"
