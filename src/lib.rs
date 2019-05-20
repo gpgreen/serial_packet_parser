@@ -30,27 +30,15 @@
 #[macro_use]
 extern crate machine;
 
-// constants for address range sizes
-const CONFIG_ARRAY_SIZE: u8 = 64;
-const DATA_ARRAY_SIZE: u8 = 60;
-const COMMAND_COUNT: u8 = 12;
-
 // MCU memory rep of a serial packet
 // real packets don't have a datalen member
-#[derive(Copy,Clone)]
+#[derive(Copy, Clone)]
 pub struct USARTPacket {
     pub pt: u8,
     pub address: u8,
     pub checksum: u16,
     pub datalen: u8,
     pub data: [u8; 64],
-}
-
-pub enum USARTPacketType {
-    Config,
-    Data,
-    Command,
-    Unknown,
 }
 
 impl USARTPacket {
@@ -61,20 +49,6 @@ impl USARTPacket {
             checksum: 0,
             datalen: 0,
             data: [0; 64],
-        }
-    }
-        
-    pub fn packet_type(self) -> USARTPacketType {
-        if self.address < CONFIG_ARRAY_SIZE {
-            USARTPacketType::Config
-        } else if self.address >= CONFIG_ARRAY_SIZE
-            && self.address < CONFIG_ARRAY_SIZE + DATA_ARRAY_SIZE
-        {
-            USARTPacketType::Data
-        } else if self.address < CONFIG_ARRAY_SIZE + DATA_ARRAY_SIZE + COMMAND_COUNT {
-            USARTPacketType::Command
-        } else {
-            USARTPacketType::Unknown
         }
     }
 
@@ -101,10 +75,9 @@ impl USARTPacket {
     }
 
     // given a packet compare stored checksum with calculated checksum
-    fn compare_checksum(&self) -> bool {
+    pub fn compare_checksum(&self) -> bool {
         self.checksum == self.compute_checksum()
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,8 +87,6 @@ pub enum PacketHeaderBytes {
     N,
     P,
 }
-
-//https://github.com/rust-bakery/machine
 
 // Define the machine states
 machine!(
@@ -128,6 +99,7 @@ machine!(
         Data { len: u8, offset: u8 },
         Checksum { first: bool, sum: u16 },
         ChecksumComplete { sum: u16 },
+        HavePacket,
     }
 );
 
@@ -146,7 +118,7 @@ transitions!(PacketParser,
                  (HaveHeader, Advance) => [Data, Checksum],
                  (Data, Advance) => [Data, Checksum],
                  (Checksum, Advance) => [ChecksumComplete, Checksum],
-                 (ChecksumComplete, Advance) => Wait
+                 (ChecksumComplete, Advance) => HavePacket
              ]
 );
 
@@ -160,7 +132,8 @@ methods!(PacketParser,
              Data => get offset: u8,
              Data => fn can_collect_data(&self) -> bool,
              ChecksumComplete => get sum: u16,
-             ChecksumComplete => fn can_collect_checksum(&self) -> bool
+             ChecksumComplete => fn can_collect_checksum(&self) -> bool,
+             HavePacket => fn have_complete_packet(&self) -> bool
          ]
 );
 
@@ -246,12 +219,9 @@ impl Checksum {
 }
 
 // allow outside code to collect checksum
-// back to wait state
 impl ChecksumComplete {
-    pub fn on_advance(self, _: Advance) -> Wait {
-        Wait {
-            got: PacketHeaderBytes::W,
-        }
+    pub fn on_advance(self, _: Advance) -> HavePacket {
+        HavePacket {}
     }
 
     pub fn can_collect_checksum(&self) -> bool {
@@ -259,75 +229,56 @@ impl ChecksumComplete {
     }
 }
 
-pub struct SerialPacketParser<'a> {
-    parser: PacketParser,
-    pkt_buffer: &'a mut USARTPacket,
-    have_recvd_pkt: bool,
+// end of state machine
+impl HavePacket {
+    pub fn have_complete_packet(&self) -> bool {
+        true
+    }
 }
 
-impl <'a> SerialPacketParser<'a> {
-
-    pub fn init(pkt: &'a mut USARTPacket) -> SerialPacketParser<'a> {
-        SerialPacketParser {
-            parser: PacketParser::Wait(Wait {
-                got: PacketHeaderBytes::W,
-            }),
-            pkt_buffer: pkt,
-            have_recvd_pkt: false,
-        }
+impl PacketParser {
+    pub fn new() -> PacketParser {
+        PacketParser::Wait(Wait {
+            got: PacketHeaderBytes::W,
+        })
     }
 
-    pub fn parse_received_byte(self, byte: u8) -> SerialPacketParser<'a> {
-        // println!("Parser before advance {:?} byte:{}", self.parser, byte);
-        match self.parser.can_collect_data() {
+    pub fn parse_received_byte(self, byte: u8, pkt: &mut USARTPacket) -> PacketParser {
+        // println!("Parser before advance {:?} byte:{}", self., byte);
+        match self.can_collect_data() {
             Some(_) => {
                 // println!("Data: {}", byte);
-                let i: usize = (*unwrap_u8(self.parser.offset())).into();
-                self.pkt_buffer.data[i] = byte;
+                let i: usize = (*unwrap_u8(self.offset())).into();
+                pkt.data[i] = byte;
             }
             None => {}
         }
-        let mut p = self.parser.on_advance(Advance { ch: byte });
+        let mut p = self.on_advance(Advance { ch: byte });
         // println!("Parser after advance {:?} byte:{}", p, byte);
         // collect checksum
-        let pkt_recvd = match p.can_collect_checksum() {
+        match p.can_collect_checksum() {
             Some(_) => {
-                self.pkt_buffer.checksum = *unwrap_u16(p.sum());
-                // println!("chksum: {}", self.pkt_buffer.checksum);
-                // go to wait state
+                pkt.checksum = *unwrap_u16(p.sum());
+                // println!("chksum: {}", pkt.checksum);
                 p = p.on_advance(Advance { ch: byte });
-                true
             }
             None => {
                 // or collect header
                 match p.can_collect_header() {
                     Some(_) => {
-                        self.pkt_buffer.pt = *unwrap_u8(p.ty());
-                        self.pkt_buffer.address = *unwrap_u8(p.addr());
-                        self.pkt_buffer.datalen = self.pkt_buffer.specified_data_size();
-                        // println!("pt: {}", self.pkt_buffer.pt);
-                        // println!("address: {}", self.pkt_buffer.address);
+                        pkt.pt = *unwrap_u8(p.ty());
+                        pkt.address = *unwrap_u8(p.addr());
+                        pkt.datalen = pkt.specified_data_size();
+                        // println!("pt: {}", pkt.pt);
+                        // println!("address: {}", pkt.address);
                         // advance to either checksum or data
                         p = p.on_advance(Advance { ch: byte });
                     }
                     None => {}
                 }
-                false
             }
         };
-        SerialPacketParser {parser: p, pkt_buffer: self.pkt_buffer, have_recvd_pkt: pkt_recvd}
-    }
-}
-
-pub fn dispatch_after_parsing(parser: & mut SerialPacketParser) {
-    if parser.have_recvd_pkt {
-        match parser.pkt_buffer.compare_checksum() {
-            true => {
-                parser.have_recvd_pkt = false;
-                0
-            }
-            false => 1,
-        };
+        p
     }
 }
 
@@ -353,85 +304,144 @@ mod tests {
     fn command_pkt() {
         // a command test packet
         let pktdata: [u8; 7] = [b's', b'n', b'p', 0b0000_0000, 0xCD, 0x02, 0x1e];
-        let mut pkt = USARTPacket {pt: 0, address: 0, checksum: 0, datalen: 0, data: [0; 64] };
-        let mut parser = SerialPacketParser::init(& mut pkt);
+        let mut pkt = USARTPacket {
+            pt: 0,
+            address: 0,
+            checksum: 0,
+            datalen: 0,
+            data: [0; 64],
+        };
+        let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
-            parser = parser.parse_received_byte(*byte);
+            parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        assert_eq!(parser.have_recvd_pkt, true);
-        assert_eq!(parser.pkt_buffer.pt, 0b0000_0000);
-        assert_eq!(parser.pkt_buffer.address, 0xCD);
-        assert_eq!(parser.pkt_buffer.datalen, 0);
-        assert_eq!(parser.pkt_buffer.checksum, 0x021E);
-        assert_eq!(parser.pkt_buffer.compare_checksum(), true);
+        match parser.have_complete_packet() {
+            Some(t) => assert_eq!(t, true),
+            None => assert_eq!(false, true,),
+        }
+        assert_eq!(pkt.pt, 0b0000_0000);
+        assert_eq!(pkt.address, 0xCD);
+        assert_eq!(pkt.datalen, 0);
+        assert_eq!(pkt.checksum, 0x021E);
+        assert_eq!(pkt.compare_checksum(), true);
     }
 
     #[test]
     fn multi_reg_read_pkt() {
         // a multiple register read test packet
         let pktdata: [u8; 7] = [b's', b'n', b'p', 0b0101_1000, 0x45, 0x01, 0xEE];
-        let mut pkt = USARTPacket {pt: 0, address: 0, checksum: 0, datalen: 0, data: [0; 64] };
-        let mut parser = SerialPacketParser::init(& mut pkt);
+        let mut pkt = USARTPacket {
+            pt: 0,
+            address: 0,
+            checksum: 0,
+            datalen: 0,
+            data: [0; 64],
+        };
+        let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
-            parser = parser.parse_received_byte(*byte);
+            parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        assert_eq!(parser.have_recvd_pkt, true);
-        assert_eq!(parser.pkt_buffer.pt, 0b0101_1000);
-        assert_eq!(parser.pkt_buffer.address, 0x45);
-        assert_eq!(parser.pkt_buffer.datalen, 24);
-        assert_eq!(parser.pkt_buffer.checksum, 0x01EE);
-        assert_eq!(parser.pkt_buffer.compare_checksum(), true);
+        match parser.have_complete_packet() {
+            Some(t) => assert_eq!(t, true),
+            None => assert_eq!(false, true,),
+        }
+        assert_eq!(pkt.pt, 0b0101_1000);
+        assert_eq!(pkt.address, 0x45);
+        assert_eq!(pkt.datalen, 24);
+        assert_eq!(pkt.checksum, 0x01EE);
+        assert_eq!(pkt.compare_checksum(), true);
     }
 
     #[test]
     fn single_reg_write_data_pkt() {
         // a single register data test packet
         let pktdata: [u8; 11] = [
-            b's', b'n', b'p', 0b1000_0000, 0x01, 0xAB, 0xCD, 0xEF, 0x12, 0x04, 0x4B,
+            b's',
+            b'n',
+            b'p',
+            0b1000_0000,
+            0x01,
+            0xAB,
+            0xCD,
+            0xEF,
+            0x12,
+            0x04,
+            0x4B,
         ];
-        let mut pkt = USARTPacket {pt: 0, address: 0, checksum: 0, datalen: 0, data: [0; 64] };
-        let mut parser = SerialPacketParser::init(& mut pkt);
+        let mut pkt = USARTPacket {
+            pt: 0,
+            address: 0,
+            checksum: 0,
+            datalen: 0,
+            data: [0; 64],
+        };
+        let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
-            parser = parser.parse_received_byte(*byte);
+            parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        assert_eq!(parser.have_recvd_pkt, true);
-        assert_eq!(parser.pkt_buffer.pt, 0b1000_0000);
-        assert_eq!(parser.pkt_buffer.address, 0x01);
-        assert_eq!(parser.pkt_buffer.datalen, 4);
-        assert_eq!(parser.pkt_buffer.data[0], 0xAB);
-        assert_eq!(parser.pkt_buffer.data[1], 0xCD);
-        assert_eq!(parser.pkt_buffer.data[2], 0xEF);
-        assert_eq!(parser.pkt_buffer.data[3], 0x12);
-        assert_eq!(parser.pkt_buffer.checksum, 0x044B);
-        assert_eq!(parser.pkt_buffer.compare_checksum(), true);
+        match parser.have_complete_packet() {
+            Some(t) => assert_eq!(t, true),
+            None => assert_eq!(false, true,),
+        }
+        assert_eq!(pkt.pt, 0b1000_0000);
+        assert_eq!(pkt.address, 0x01);
+        assert_eq!(pkt.datalen, 4);
+        assert_eq!(pkt.data[0], 0xAB);
+        assert_eq!(pkt.data[1], 0xCD);
+        assert_eq!(pkt.data[2], 0xEF);
+        assert_eq!(pkt.data[3], 0x12);
+        assert_eq!(pkt.checksum, 0x044B);
+        assert_eq!(pkt.compare_checksum(), true);
     }
 
     #[test]
     fn mult_reg_write_data_pkt() {
         // a multiple register data test packet
         let pktdata: [u8; 15] = [
-            b's', b'n', b'p', 0b1100_1000, 0x03, 0xAB, 0xCD, 0xEF, 0x12, 0xAB, 0xCD, 0xEF, 0x12, 0x07,
+            b's',
+            b'n',
+            b'p',
+            0b1100_1000,
+            0x03,
+            0xAB,
+            0xCD,
+            0xEF,
+            0x12,
+            0xAB,
+            0xCD,
+            0xEF,
+            0x12,
+            0x07,
             0x0E,
         ];
-        let mut pkt = USARTPacket {pt: 0, address: 0, checksum: 0, datalen: 0, data: [0; 64] };
-        let mut parser = SerialPacketParser::init(& mut pkt);
+        let mut pkt = USARTPacket {
+            pt: 0,
+            address: 0,
+            checksum: 0,
+            datalen: 0,
+            data: [0; 64],
+        };
+        let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
-            parser = parser.parse_received_byte(*byte);
+            parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        assert_eq!(parser.have_recvd_pkt, true);
-        assert_eq!(parser.pkt_buffer.pt, 0b1100_1000);
-        assert_eq!(parser.pkt_buffer.address, 0x03);
-        assert_eq!(parser.pkt_buffer.datalen, 8);
-        assert_eq!(parser.pkt_buffer.data[0], 0xAB);
-        assert_eq!(parser.pkt_buffer.data[1], 0xCD);
-        assert_eq!(parser.pkt_buffer.data[2], 0xEF);
-        assert_eq!(parser.pkt_buffer.data[3], 0x12);
-        assert_eq!(parser.pkt_buffer.data[4], 0xAB);
-        assert_eq!(parser.pkt_buffer.data[5], 0xCD);
-        assert_eq!(parser.pkt_buffer.data[6], 0xEF);
-        assert_eq!(parser.pkt_buffer.data[7], 0x12);
-        assert_eq!(parser.pkt_buffer.checksum, 0x070E);
-        assert_eq!(parser.pkt_buffer.compare_checksum(), true);
+        match parser.have_complete_packet() {
+            Some(t) => assert_eq!(t, true),
+            None => assert_eq!(false, true,),
+        }
+        assert_eq!(pkt.pt, 0b1100_1000);
+        assert_eq!(pkt.address, 0x03);
+        assert_eq!(pkt.datalen, 8);
+        assert_eq!(pkt.data[0], 0xAB);
+        assert_eq!(pkt.data[1], 0xCD);
+        assert_eq!(pkt.data[2], 0xEF);
+        assert_eq!(pkt.data[3], 0x12);
+        assert_eq!(pkt.data[4], 0xAB);
+        assert_eq!(pkt.data[5], 0xCD);
+        assert_eq!(pkt.data[6], 0xEF);
+        assert_eq!(pkt.data[7], 0x12);
+        assert_eq!(pkt.checksum, 0x070E);
+        assert_eq!(pkt.compare_checksum(), true);
     }
 
     #[test]
@@ -441,15 +451,24 @@ mod tests {
             b's', b'n', b'b', 0xc8, 0x03, 0xAB, 0xCD, 0xEF, 0x12, 0xAB, 0xCD, 0xEF, 0x12, 0x07,
             0x0E,
         ];
-        let mut pkt = USARTPacket {pt: 0, address: 0, checksum: 0, datalen: 0, data: [0; 64] };
-        let mut parser = SerialPacketParser::init(& mut pkt);
+        let mut pkt = USARTPacket {
+            pt: 0,
+            address: 0,
+            checksum: 0,
+            datalen: 0,
+            data: [0; 64],
+        };
+        let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
-            parser = parser.parse_received_byte(*byte);
+            parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        assert_ne!(parser.have_recvd_pkt, true);
-        assert_eq!(parser.pkt_buffer.pt, 0);
-        assert_eq!(parser.pkt_buffer.address, 0);
-        assert_eq!(parser.pkt_buffer.datalen, 0);
-        assert_eq!(parser.pkt_buffer.checksum, 0);
+        match parser.have_complete_packet() {
+            Some(_) => assert_eq!(false, true),
+            None => assert_eq!(true, true,),
+        }
+        assert_eq!(pkt.pt, 0);
+        assert_eq!(pkt.address, 0);
+        assert_eq!(pkt.datalen, 0);
+        assert_eq!(pkt.checksum, 0);
     }
 }
