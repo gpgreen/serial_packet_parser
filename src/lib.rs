@@ -149,7 +149,7 @@ impl Wait {
         if got != PacketHeaderBytes::P {
             PacketParser::wait(got)
         } else {
-            PacketParser::packettype()
+            PacketParser::packet_type()
         }
     }
 }
@@ -213,7 +213,7 @@ impl Checksum {
             PacketParser::checksum(false, s << 8)
         } else {
             let s: (u16) = input.ch.into();
-            PacketParser::checksumcomplete(s | self.sum)
+            PacketParser::checksum_complete(s | self.sum)
         }
     }
 }

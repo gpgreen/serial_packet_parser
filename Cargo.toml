@@ -6,5 +6,5 @@ edition = "2018"
 license = "GPL-3.0"
 
 [dependencies]
-heapless = "0.4.4"
-machine = "^0.2"
+heapless = "0.5.1"
+machine = "0.3.0"
