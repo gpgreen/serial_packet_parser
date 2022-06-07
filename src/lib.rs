@@ -209,10 +209,10 @@ impl Data {
 impl Checksum {
     pub fn on_advance(self, input: Advance) -> PacketParser {
         if self.first {
-            let s: (u16) = input.ch.into();
+            let s: u16 = input.ch.into();
             PacketParser::checksum(false, s << 8)
         } else {
-            let s: (u16) = input.ch.into();
+            let s: u16 = input.ch.into();
             PacketParser::checksum_complete(s | self.sum)
         }
     }
