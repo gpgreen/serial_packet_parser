@@ -1,70 +1,225 @@
 #![no_std]
-//! # serial_packet
+//! # serial_network_packet
 //!
 //! ## Features
 //!
-//! This crate defines a SerialPacketParser that will receive a byte at a time and
-//! parse serial packets from the stream
-
-// Incoming Packet Bytes
-//  Header
-// |0|1|1|1|0|0|1|1| = 's'
-// |0|1|1|0|1|1|1|0| = 'n'
-// |0|1|1|1|0|0|0|0| = 'p'
-// |HD|B|DL3|DL2|DL1|DL0|x|x| = packet type
-//   HD = set if packet has data to write
-//   B = set if packet is a batch read/write
-//   DL = batch size / 4
-//   datalength is 0 if HD clear
-//   datalength is 4 if HD set and B clear (DL field ignored)
-//   datalength = 4*DL if HD and B set, a write request with bytes to write
-//   datalength = 4*DL if HD clear and B set, a read request
-// |0|0|0|0|0|0|0|0| = packet address
-//  Data
-// |0|0|0|0|0|0|0|0| = first byte of data (up to 60 bytes)
-// ....
-//  Checksum
-// |0|0|0|0|0|0|0|0| = first byte of checksum
-// |0|0|0|0|0|0|0|0| = second byte of checksum
+//! This crate defines a SerialNetworkPacket that is intended to work with devices that have
+//! an address and value type of configuration. The targeted addresses are expected to be mostly
+//! sequential, so that multiple values can be written with a starting address that is incremented
+//! for each value. This behaviour is similar to that implemented in a lot of hardware peripherals.
+//! There are 4 types of packets, Read/Write/BatchRead/BatchWrite. The sequence of values can
+//! be up to 64 bytes in length. This keeps the packet to a known maximum size so that it is easy
+//! to use on systems with no dynamic memory allocation.
+//!
+//! The packet's are defined as follows:
+//!
+//! |0|1|1|1|0|0|1|1| = 's'
+//! |0|1|1|0|1|1|1|0| = 'n'
+//! |0|1|1|1|0|0|0|0| = 'p'
+//! |WR|B|DL3|DL2|DL1|DL0|x|x| = packet type
+//!   WR (Write bit) = set if packet has data to write
+//!   B (Batch Bit) = set if packet is a batch read/write
+//!   DL (Datalen field) = batch size / 4
+//!     [WR:0 B:0] datalength = 0
+//!     [WR:1 B:0] datalength = 4 (DL field ignored)
+//!     [WR:1 B:1] datalength = 4*DL, a write request with bytes to write
+//!     [WR:0 B:1] datalength = 4*DL, a read request
+//!   Final 2 bits are ignored
+//! |x|x|x|x|x|x|x|x| = packet address
+//! |x|x|x|x|x|x|x|x| = first byte of data
+//! ....
+//! |x|x|x|x|x|x|x|x| = last byte of data
+//! |x|x|x|x|x|x|x|x| = first byte of checksum
+//! |x|x|x|x|x|x|x|x| = second byte of checksum
+//!
+//! This crate defines a `PacketParser` which is a state machine that parses
+//! SerialNetworkPacket's a byte at a time. This is intended for use with Serial Port
+//! hardware. The parser is implemented with the `machine` crate.
 
 #[macro_use]
 extern crate machine;
+mod parser;
 
-// MCU memory rep of a serial packet
-// real packets don't have a datalen member
-#[derive(Copy, Clone)]
-pub struct USARTPacket {
-    pub pt: u8,
+use core::convert::TryFrom;
+use defmt::Format;
+use parser::PacketParser;
+
+/// Errors that can be encountered in this crate
+#[derive(Debug, Copy, Clone, PartialEq, Format)]
+pub enum SerialPacketError {
+    /// Data length not within bounds
+    DataLen(usize),
+    /// Checksum doesn't match contents of packet
+    Checksum,
+    /// A write packet must have data
+    WritePacketEmptyData,
+}
+
+/// Constrain a u8 to values allowed for packet data length [4..64]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Format)]
+pub struct PacketDataLen(u8);
+
+impl PacketDataLen {
+    /// Create a new PacketDataLen
+    pub const fn new(value: u8) -> Result<Self, SerialPacketError> {
+        if value >= 4 && value <= 64 {
+            Ok(Self(value))
+        } else {
+            Err(SerialPacketError::DataLen(value as usize))
+        }
+    }
+    /// Get the u8 value of the PacketDataLen
+    pub const fn u8(&self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<usize> for PacketDataLen {
+    type Error = SerialPacketError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        if value >= 4 && value <= 64 {
+            Ok(Self(value as u8))
+        } else {
+            Err(SerialPacketError::DataLen(value))
+        }
+    }
+}
+
+/// Serial Packet Type Enumeration
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Format)]
+pub enum SerialPacketType {
+    Read,
+    Write,
+    BatchRead(PacketDataLen),
+    BatchWrite(PacketDataLen),
+}
+
+impl From<SerialPacketTypeField> for SerialPacketType {
+    fn from(ptf: SerialPacketTypeField) -> Self {
+        match (ptf.is_batch(), ptf.is_write()) {
+            (false, false) => SerialPacketType::Read,
+            (false, true) => SerialPacketType::Write,
+            (true, false) => {
+                SerialPacketType::BatchRead(PacketDataLen::new(ptf.datalen()).unwrap())
+            }
+            (true, true) => {
+                SerialPacketType::BatchWrite(PacketDataLen::new(ptf.datalen()).unwrap())
+            }
+        }
+    }
+}
+
+impl SerialPacketType {
+    /// Get an equivalent u8 for the Enumeration value
+    pub fn u8(&self) -> u8 {
+        match self {
+            SerialPacketType::Write => 0b1000_0000,
+            SerialPacketType::Read => 0,
+            SerialPacketType::BatchRead(datalen) => 0b0100_0000 | ((datalen.u8() & 0xf) << 2),
+            SerialPacketType::BatchWrite(datalen) => 0b1100_0000 | ((datalen.u8() & 0xf) << 2),
+        }
+    }
+}
+
+/// Packet Type Field
+#[derive(Debug, Copy, Clone, Format)]
+pub struct SerialPacketTypeField(u8);
+
+impl SerialPacketTypeField {
+    /// is this a write request
+    pub fn is_write(&self) -> bool {
+        self.0 & 0x80 != 0
+    }
+    /// is this a batch request?
+    pub fn is_batch(&self) -> bool {
+        self.0 & 0x40 != 0
+    }
+    /// datalength in bytes
+    pub fn datalen(&self) -> u8 {
+        match self.0 & 0b1100_0000 {
+            // read request, no data
+            0b0000_0000 => 0,
+            // write request, no batch, dl = 4
+            0b1000_0000 => 4,
+            // read/write batch request, 4 * data len
+            0b0100_0000 | 0b1100_0000 => 4 * ((self.0 & 0x3c) >> 2),
+            _ => panic!(), // will never be reached
+        }
+    }
+}
+
+impl PartialEq<SerialPacketTypeField> for SerialPacketTypeField {
+    /// PartialEq implemented so ignored fields are not used in comparisons
+    fn eq(&self, other: &SerialPacketTypeField) -> bool {
+        other.is_write() == self.is_write()
+            && other.is_batch() == self.is_batch()
+            && other.datalen() == self.datalen()
+    }
+}
+
+/// Serial Network Packet
+#[derive(Debug, Copy, Clone, Format)]
+pub struct SerialNetworkPacket {
+    pub pt: SerialPacketTypeField,
     pub address: u8,
     pub checksum: u16,
-    pub datalen: u8,
     pub data: [u8; 64],
 }
 
-impl USARTPacket {
-    pub fn new() -> USARTPacket {
-        USARTPacket {
-            pt: 0,
+impl SerialNetworkPacket {
+    /// an empty packet
+    pub fn empty() -> Self {
+        SerialNetworkPacket {
+            pt: SerialPacketTypeField(0),
             address: 0,
             checksum: 0,
-            datalen: 0,
             data: [0; 64],
         }
     }
 
-    pub fn specified_data_size(&self) -> u8 {
-        let flags = self.pt & 0xC0;
-        match flags {
-            0b1000_0000 => 4,
-            0b1100_0000 => 4 * ((self.pt >> 2) & 0x0F),
-            0b0100_0000 => 4 * ((self.pt >> 2) & 0x0F),
-            _ => 0,
-        }
+    /// a Read packet
+    pub fn new_read(address: u8, datalen: PacketDataLen) -> Result<Self, SerialPacketError> {
+        let ty = if datalen.u8() == 4 {
+            SerialPacketType::Read
+        } else {
+            SerialPacketType::BatchRead(datalen)
+        };
+        // calculate the checksum
+        let mut pkt = SerialNetworkPacket {
+            pt: SerialPacketTypeField(ty.u8()),
+            address,
+            checksum: 0,
+            data: [0; 64],
+        };
+        pkt.checksum = pkt.compute_checksum();
+        Ok(pkt)
     }
 
-    // given a packet, calculate the checksum for it
+    /// a Write packet
+    pub fn new_write(address: u8, data: &[u8]) -> Result<Self, SerialPacketError> {
+        let ty = if data.is_empty() {
+            return Err(SerialPacketError::WritePacketEmptyData);
+        } else if data.len() == 4 {
+            SerialPacketType::Write
+        } else {
+            SerialPacketType::BatchRead(PacketDataLen::try_from(data.len())?)
+        };
+        let mut buf = [0; 64];
+        buf[0..data.len()].clone_from_slice(data);
+        let mut pkt = SerialNetworkPacket {
+            pt: SerialPacketTypeField(ty.u8()),
+            address,
+            checksum: 0,
+            data: buf,
+        };
+        pkt.checksum = pkt.compute_checksum();
+        Ok(pkt)
+    }
+
+    /// calculate packet checksum from elements
     pub fn compute_checksum(&self) -> u16 {
-        let pt: u16 = self.pt.into();
+        let pt: u16 = self.pt.0.into();
         let addr: u16 = self.address.into();
         let mut sum: u16 = 0x0073 + 0x006E + 0x0070 + pt + addr;
         for byte in self.data.iter() {
@@ -74,225 +229,44 @@ impl USARTPacket {
         sum
     }
 
-    // given a packet compare stored checksum with calculated checksum
+    /// compare stored checksum with calculated checksum
     pub fn compare_checksum(&self) -> bool {
         self.checksum == self.compute_checksum()
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum PacketHeaderBytes {
-    W,
-    S,
-    N,
-    P,
+pub struct PacketStream {
+    parser: PacketParser,
+    packet: SerialNetworkPacket,
 }
 
-// Define the machine states
-machine!(
-    #[derive(Clone, Debug, PartialEq)]
-    enum PacketParser {
-        Wait { got: PacketHeaderBytes },
-        PacketType,
-        Address { ty: u8 },
-        HaveHeader { ty: u8, addr: u8 },
-        Data { len: u8, offset: u8 },
-        Checksum { first: bool, sum: u16 },
-        ChecksumComplete { sum: u16 },
-        HavePacket,
-    }
-);
-
-// The transition types
-#[derive(Clone, Debug, PartialEq)]
-pub struct Advance {
-    ch: u8,
-}
-
-// the allowed state, transition pairs
-transitions!(PacketParser,
-             [
-                 (Wait, Advance) => [PacketType, Wait],
-                 (PacketType, Advance) => Address,
-                 (Address, Advance) => HaveHeader,
-                 (HaveHeader, Advance) => [Data, Checksum],
-                 (Data, Advance) => [Data, Checksum],
-                 (Checksum, Advance) => [ChecksumComplete, Checksum],
-                 (ChecksumComplete, Advance) => HavePacket
-             ]
-);
-
-// additional methods to add to the parser for retrieving data
-methods!(PacketParser,
-         [
-             HaveHeader => get ty: u8,
-             HaveHeader => get addr: u8,
-             HaveHeader => fn can_collect_header(&self) -> bool,
-             Data => get len: u8,
-             Data => get offset: u8,
-             Data => fn can_collect_data(&self) -> bool,
-             ChecksumComplete => get sum: u16,
-             ChecksumComplete => fn can_collect_checksum(&self) -> bool,
-             HavePacket => fn have_complete_packet(&self) -> bool
-         ]
-);
-
-// wait state looking for packet header of 'snp'
-impl Wait {
-    pub fn on_advance(self, input: Advance) -> PacketParser {
-        let got = match (self.got, input.ch) {
-            (PacketHeaderBytes::W, b's') => PacketHeaderBytes::S,
-            (PacketHeaderBytes::S, b'n') => PacketHeaderBytes::N,
-            (PacketHeaderBytes::N, b'p') => PacketHeaderBytes::P,
-            (_, _) => PacketHeaderBytes::W,
-        };
-        if got != PacketHeaderBytes::P {
-            PacketParser::wait(got)
-        } else {
-            PacketParser::packet_type()
-        }
-    }
-}
-
-// After the header, we receive the packet type byte
-impl PacketType {
-    pub fn on_advance(self, input: Advance) -> Address {
-        Address { ty: input.ch }
-    }
-}
-
-// After the packet type byte, we receive the address
-impl Address {
-    pub fn on_advance(self, input: Advance) -> HaveHeader {
-        HaveHeader {
-            ty: self.ty,
-            addr: input.ch,
-        }
-    }
-}
-
-// once we have the header, type, and address, go to a state where
-// outside code can retrieve the type and address, calculate the packet
-// data length
-impl HaveHeader {
-    pub fn on_advance(self, _: Advance) -> PacketParser {
-        let flags = self.ty & 0xC0;
-        match flags {
-            0b1000_0000 => PacketParser::data(4, 0),
-            0b1100_0000 => PacketParser::data(4 * ((self.ty >> 2) & 0x0F), 0),
-            0b0100_0000 => PacketParser::checksum(true, 0),
-            _ => PacketParser::checksum(true, 0),
+impl PacketStream {
+    pub fn new() -> Self {
+        PacketStream {
+            parser: PacketParser::new(),
+            packet: SerialNetworkPacket::empty(),
         }
     }
 
-    pub fn can_collect_header(&self) -> bool {
-        true
-    }
-}
-
-// get the packet data (if any)
-impl Data {
-    pub fn on_advance(self, _input: Advance) -> PacketParser {
-        if self.offset < self.len - 1 {
-            PacketParser::data(self.len, self.offset + 1)
-        } else {
-            PacketParser::checksum(true, 0)
-        }
-    }
-
-    pub fn can_collect_data(&self) -> bool {
-        true
-    }
-}
-
-// receive the transmitted checksum bytes
-impl Checksum {
-    pub fn on_advance(self, input: Advance) -> PacketParser {
-        if self.first {
-            let s: u16 = input.ch.into();
-            PacketParser::checksum(false, s << 8)
-        } else {
-            let s: u16 = input.ch.into();
-            PacketParser::checksum_complete(s | self.sum)
-        }
-    }
-}
-
-// allow outside code to collect checksum
-impl ChecksumComplete {
-    pub fn on_advance(self, _: Advance) -> HavePacket {
-        HavePacket {}
-    }
-
-    pub fn can_collect_checksum(&self) -> bool {
-        true
-    }
-}
-
-// end of state machine
-impl HavePacket {
-    pub fn have_complete_packet(&self) -> bool {
-        true
-    }
-}
-
-impl PacketParser {
-    pub fn new() -> PacketParser {
-        PacketParser::Wait(Wait {
-            got: PacketHeaderBytes::W,
-        })
-    }
-
-    pub fn parse_received_byte(self, byte: u8, pkt: &mut USARTPacket) -> PacketParser {
-        // println!("Parser before advance {:?} byte:{}", self., byte);
-        match self.can_collect_data() {
-            Some(_) => {
-                // println!("Data: {}", byte);
-                let i: usize = (*unwrap_u8(self.offset())).into();
-                pkt.data[i] = byte;
+    pub fn feed(&mut self, byte: u8) -> Result<Option<SerialNetworkPacket>, SerialPacketError> {
+        self.parser = self
+            .parser
+            .clone()
+            .parse_received_byte(byte, &mut self.packet);
+        if self.parser.have_complete_packet().is_some() {
+            // parser found complete packet
+            let pkt = self.packet;
+            // reset input packet
+            self.packet = SerialNetworkPacket::empty();
+            // switch based on checksum of received packet
+            if pkt.compare_checksum() {
+                Ok(Some(pkt))
+            } else {
+                Err(SerialPacketError::Checksum)
             }
-            None => {}
+        } else {
+            Ok(None)
         }
-        let mut p = self.on_advance(Advance { ch: byte });
-        // println!("Parser after advance {:?} byte:{}", p, byte);
-        // collect checksum
-        match p.can_collect_checksum() {
-            Some(_) => {
-                pkt.checksum = *unwrap_u16(p.sum());
-                // println!("chksum: {}", pkt.checksum);
-                p = p.on_advance(Advance { ch: byte });
-            }
-            None => {
-                // or collect header
-                match p.can_collect_header() {
-                    Some(_) => {
-                        pkt.pt = *unwrap_u8(p.ty());
-                        pkt.address = *unwrap_u8(p.addr());
-                        pkt.datalen = pkt.specified_data_size();
-                        // println!("pt: {}", pkt.pt);
-                        // println!("address: {}", pkt.address);
-                        // advance to either checksum or data
-                        p = p.on_advance(Advance { ch: byte });
-                    }
-                    None => {}
-                }
-            }
-        };
-        p
-    }
-}
-
-fn unwrap_u8(optional: Option<&u8>) -> &u8 {
-    match optional {
-        Some(p) => p,
-        None => panic!(""),
-    }
-}
-
-fn unwrap_u16(optional: Option<&u16>) -> &u16 {
-    match optional {
-        Some(p) => p,
-        None => panic!(""),
     }
 }
 
@@ -301,60 +275,124 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_pkt() {
-        // a command test packet
+    fn packet_data_len_range() {
+        assert!(PacketDataLen::new(4).is_ok());
+        assert!(PacketDataLen::new(64).is_ok());
+        assert!(matches!(
+            PacketDataLen::new(65),
+            Err(crate::SerialPacketError::DataLen(65))
+        ));
+        assert!(matches!(
+            PacketDataLen::new(0),
+            Err(crate::SerialPacketError::DataLen(0))
+        ));
+        assert!(PacketDataLen::try_from(5_usize).is_ok());
+        assert!(matches!(
+            PacketDataLen::try_from(0_usize),
+            Err(crate::SerialPacketError::DataLen(0))
+        ));
+    }
+
+    #[test]
+    fn serial_packet_type() {
+        let rd = SerialPacketType::Read;
+        assert_eq!(
+            SerialPacketType::from(SerialPacketTypeField(0)).u8(),
+            rd.u8()
+        );
+        let wr = SerialPacketType::Write;
+        assert_eq!(
+            SerialPacketType::from(SerialPacketTypeField(0b1000_0000)).u8(),
+            wr.u8()
+        );
+        let rdb = SerialPacketType::BatchRead(PacketDataLen(4));
+        assert_eq!(
+            SerialPacketType::from(SerialPacketTypeField(0b0100_0100)).u8(),
+            rdb.u8()
+        );
+        let wrdb = SerialPacketType::BatchWrite(PacketDataLen(64));
+        assert_eq!(
+            SerialPacketType::from(SerialPacketTypeField(0b1110_0000)).u8(),
+            wrdb.u8()
+        );
+    }
+
+    #[test]
+    fn serial_packet_type_field_partialeq() {
+        // using unchecked bits
+        assert_eq!(
+            SerialPacketTypeField(0b0000_0001),
+            SerialPacketTypeField(0b0000_0000)
+        );
+        // using unchecked bits
+        assert_eq!(
+            SerialPacketTypeField(0b0000_0011),
+            SerialPacketTypeField(0b0000_0000)
+        );
+        // read request doesn't check datalen
+        assert_eq!(
+            SerialPacketTypeField(0b0011_0000),
+            SerialPacketTypeField(0b0000_0000)
+        );
+        // batchread matches
+        assert_eq!(
+            SerialPacketTypeField(0b0100_1000),
+            SerialPacketTypeField(0b0100_1000)
+        );
+        // using unchecked bits
+        assert_eq!(
+            SerialPacketTypeField(0b1011_0000),
+            SerialPacketTypeField(0b1011_0011)
+        );
+    }
+
+    #[test]
+    fn read_pkt() {
+        // a read packet
         let pktdata: [u8; 7] = [b's', b'n', b'p', 0b0000_0000, 0xCD, 0x02, 0x1e];
-        let mut pkt = USARTPacket {
-            pt: 0,
-            address: 0,
-            checksum: 0,
-            datalen: 0,
-            data: [0; 64],
-        };
+        let mut pkt = SerialNetworkPacket::empty();
         let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
+            if parser.have_complete_packet().is_some() {
+                panic!();
+            }
             parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        match parser.have_complete_packet() {
-            Some(t) => assert_eq!(t, true),
-            None => assert_eq!(false, true,),
+        if parser.have_complete_packet().is_none() {
+            panic!();
         }
-        assert_eq!(pkt.pt, 0b0000_0000);
         assert_eq!(pkt.address, 0xCD);
-        assert_eq!(pkt.datalen, 0);
+        assert!(!pkt.pt.is_write() && !pkt.pt.is_batch());
+        assert_eq!(pkt.pt.datalen(), 0);
         assert_eq!(pkt.checksum, 0x021E);
-        assert_eq!(pkt.compare_checksum(), true);
+        assert!(pkt.compare_checksum());
     }
 
     #[test]
-    fn multi_reg_read_pkt() {
-        // a multiple register read test packet
+    fn batch_read_pkt() {
+        // a batch read test packet
         let pktdata: [u8; 7] = [b's', b'n', b'p', 0b0101_1000, 0x45, 0x01, 0xEE];
-        let mut pkt = USARTPacket {
-            pt: 0,
-            address: 0,
-            checksum: 0,
-            datalen: 0,
-            data: [0; 64],
-        };
+        let mut pkt = SerialNetworkPacket::empty();
         let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
+            if parser.have_complete_packet().is_some() {
+                panic!();
+            }
             parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        match parser.have_complete_packet() {
-            Some(t) => assert_eq!(t, true),
-            None => assert_eq!(false, true,),
+        if parser.have_complete_packet().is_none() {
+            panic!();
         }
-        assert_eq!(pkt.pt, 0b0101_1000);
+        assert!(!pkt.pt.is_write() && pkt.pt.is_batch());
+        assert_eq!(pkt.pt.datalen(), 24);
         assert_eq!(pkt.address, 0x45);
-        assert_eq!(pkt.datalen, 24);
         assert_eq!(pkt.checksum, 0x01EE);
-        assert_eq!(pkt.compare_checksum(), true);
+        assert!(pkt.compare_checksum());
     }
 
     #[test]
-    fn single_reg_write_data_pkt() {
-        // a single register data test packet
+    fn write_data_pkt() {
+        // a write data test packet
         let pktdata: [u8; 11] = [
             b's',
             b'n',
@@ -368,35 +406,31 @@ mod tests {
             0x04,
             0x4B,
         ];
-        let mut pkt = USARTPacket {
-            pt: 0,
-            address: 0,
-            checksum: 0,
-            datalen: 0,
-            data: [0; 64],
-        };
+        let mut pkt = SerialNetworkPacket::empty();
         let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
+            if parser.have_complete_packet().is_some() {
+                panic!();
+            }
             parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        match parser.have_complete_packet() {
-            Some(t) => assert_eq!(t, true),
-            None => assert_eq!(false, true,),
+        if parser.have_complete_packet().is_none() {
+            panic!();
         }
-        assert_eq!(pkt.pt, 0b1000_0000);
+        assert!(pkt.pt.is_write() && !pkt.pt.is_batch());
+        assert_eq!(pkt.pt.datalen(), 4);
         assert_eq!(pkt.address, 0x01);
-        assert_eq!(pkt.datalen, 4);
         assert_eq!(pkt.data[0], 0xAB);
         assert_eq!(pkt.data[1], 0xCD);
         assert_eq!(pkt.data[2], 0xEF);
         assert_eq!(pkt.data[3], 0x12);
         assert_eq!(pkt.checksum, 0x044B);
-        assert_eq!(pkt.compare_checksum(), true);
+        assert!(pkt.compare_checksum());
     }
 
     #[test]
-    fn mult_reg_write_data_pkt() {
-        // a multiple register data test packet
+    fn batch_write_data_pkt() {
+        // a batch write test packet
         let pktdata: [u8; 15] = [
             b's',
             b'n',
@@ -414,24 +448,19 @@ mod tests {
             0x07,
             0x0E,
         ];
-        let mut pkt = USARTPacket {
-            pt: 0,
-            address: 0,
-            checksum: 0,
-            datalen: 0,
-            data: [0; 64],
-        };
+        let mut pkt = SerialNetworkPacket::empty();
         let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
+            if parser.have_complete_packet().is_some() {
+                panic!();
+            }
             parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        match parser.have_complete_packet() {
-            Some(t) => assert_eq!(t, true),
-            None => assert_eq!(false, true,),
+        if parser.have_complete_packet().is_none() {
+            panic!();
         }
-        assert_eq!(pkt.pt, 0b1100_1000);
+        assert_eq!(pkt.pt.0, 0b1100_1000);
         assert_eq!(pkt.address, 0x03);
-        assert_eq!(pkt.datalen, 8);
         assert_eq!(pkt.data[0], 0xAB);
         assert_eq!(pkt.data[1], 0xCD);
         assert_eq!(pkt.data[2], 0xEF);
@@ -441,34 +470,114 @@ mod tests {
         assert_eq!(pkt.data[6], 0xEF);
         assert_eq!(pkt.data[7], 0x12);
         assert_eq!(pkt.checksum, 0x070E);
-        assert_eq!(pkt.compare_checksum(), true);
+        assert!(pkt.compare_checksum());
     }
 
     #[test]
     fn corrupted() {
-        // a corrupted data test packet
+        // a corrupted data test packet, bad magic
         let pktdata: [u8; 15] = [
             b's', b'n', b'b', 0xc8, 0x03, 0xAB, 0xCD, 0xEF, 0x12, 0xAB, 0xCD, 0xEF, 0x12, 0x07,
             0x0E,
         ];
-        let mut pkt = USARTPacket {
-            pt: 0,
-            address: 0,
-            checksum: 0,
-            datalen: 0,
-            data: [0; 64],
-        };
+        let mut pkt = SerialNetworkPacket::empty();
         let mut parser = PacketParser::new();
         for byte in pktdata.iter() {
             parser = parser.parse_received_byte(*byte, &mut pkt);
+            if parser.have_complete_packet().is_some() {
+                panic!();
+            }
         }
-        match parser.have_complete_packet() {
-            Some(_) => assert_eq!(false, true),
-            None => assert_eq!(true, true,),
+    }
+
+    #[test]
+    fn bad_checksum() {
+        // a corrupted data test packet, bad checksum
+        let pktdata: [u8; 15] = [
+            b's', b'n', b'p', 0xc8, 0x03, 0xAB, 0xCD, 0xEF, 0x12, 0xAB, 0xCD, 0xEF, 0x12, 0x08,
+            0x0E,
+        ];
+        let mut pkt = SerialNetworkPacket::empty();
+        let mut parser = PacketParser::new();
+        for byte in pktdata.iter() {
+            if parser.have_complete_packet().is_some() {
+                panic!();
+            }
+            parser = parser.parse_received_byte(*byte, &mut pkt);
         }
-        assert_eq!(pkt.pt, 0);
-        assert_eq!(pkt.address, 0);
-        assert_eq!(pkt.datalen, 0);
-        assert_eq!(pkt.checksum, 0);
+        assert!(!pkt.compare_checksum());
+    }
+
+    #[test]
+    fn midstream() {
+        // parse the packet not assuming first bytes are packet magic bytes
+        let pktdata: [u8; 11] = [
+            0xde,
+            0xad,
+            0xbe,
+            0xef,
+            b's',
+            b'n',
+            b'p',
+            0b0000_0000,
+            0xCD,
+            0x02,
+            0x1e,
+        ];
+        let mut pkt = SerialNetworkPacket::empty();
+        let mut parser = PacketParser::new();
+        for byte in pktdata.iter() {
+            if parser.have_complete_packet().is_some() {
+                panic!();
+            }
+            parser = parser.parse_received_byte(*byte, &mut pkt);
+        }
+        if parser.have_complete_packet().is_none() {
+            panic!();
+        }
+        assert!(!pkt.pt.is_write() && !pkt.pt.is_batch());
+        assert_eq!(pkt.pt.datalen(), 0);
+        assert_eq!(pkt.address, 0xcd);
+        assert!(pkt.compare_checksum());
+    }
+
+    #[test]
+    fn two_packets() {
+        // parse the packet not assuming first bytes are packet magic bytes
+        let pktdata: [u8; 22] = [
+            0xde,
+            0xad,
+            0xbe,
+            0xef,
+            b's',
+            b'n',
+            b'p',
+            0b0000_0000,
+            0xCD,
+            0x02,
+            0x1e,
+            0xde,
+            0xad,
+            0xbe,
+            0xef,
+            b's',
+            b'n',
+            b'p',
+            0b0000_0000,
+            0xCD,
+            0x02,
+            0x1e,
+        ];
+        let mut pkt = SerialNetworkPacket::empty();
+        let mut parser = PacketParser::new();
+        for byte in pktdata.iter() {
+            parser = parser.parse_received_byte(*byte, &mut pkt);
+            if parser.have_complete_packet().is_some() {
+                assert!(!pkt.pt.is_write() && !pkt.pt.is_batch());
+                assert_eq!(pkt.pt.datalen(), 0);
+                assert_eq!(pkt.address, 0xcd);
+                assert!(pkt.compare_checksum());
+            }
+        }
     }
 }
