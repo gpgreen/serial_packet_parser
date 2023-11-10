@@ -12,26 +12,25 @@
 //! to use on systems with no dynamic memory allocation.
 //!
 //! The packet's are defined as follows:
-//!
+//! ```ignore
 //! |0|1|1|1|0|0|1|1| = 's'
 //! |0|1|1|0|1|1|1|0| = 'n'
 //! |0|1|1|1|0|0|0|0| = 'p'
 //! |WR|B|DL3|DL2|DL1|DL0|x|x| = packet type
 //!   WR (Write bit) = set if packet has data to write
-//!   B (Batch Bit) = set if packet is a batch read/write
-//!   DL (Datalen field) = batch size / 4
+//!   B (Batch Bit) = set if packet is a batch read, ignored if write
+//!   DL (Datalen field) = (datalen / 4) >> 1
 //!     [WR:0 B:0] datalength = 0
-//!     [WR:1 B:0] datalength = 4 (DL field ignored)
-//!     [WR:1 B:1] datalength = 4*DL, a write request with bytes to write
-//!     [WR:0 B:1] datalength = 4*DL, a read request
+//!     [WR:1 B:x] datalength = 4 * (DL + 4), a write request with bytes to write
+//!     [WR:0 B:1] datalength = 4 * (DL + 4), a read request
 //!   Final 2 bits are ignored
 //! |x|x|x|x|x|x|x|x| = packet address
 //! |x|x|x|x|x|x|x|x| = first byte of data
 //! ....
 //! |x|x|x|x|x|x|x|x| = last byte of data
-//! |x|x|x|x|x|x|x|x| = first byte of checksum
-//! |x|x|x|x|x|x|x|x| = second byte of checksum
-//!
+//! |x|x|x|x|x|x|x|x| = first (high) byte of checksum
+//! |x|x|x|x|x|x|x|x| = second (low) byte of checksum
+//! ```
 //! This crate defines a `PacketParser` which is a state machine that parses
 //! SerialNetworkPacket's a byte at a time. This is intended for use with Serial Port
 //! hardware. The parser is implemented with the `machine` crate.
@@ -90,21 +89,19 @@ impl TryFrom<usize> for PacketDataLen {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Format)]
 pub enum SerialPacketType {
     Read,
-    Write,
     BatchRead(PacketDataLen),
-    BatchWrite(PacketDataLen),
+    Write(PacketDataLen),
 }
 
 impl From<SerialPacketTypeField> for SerialPacketType {
     fn from(ptf: SerialPacketTypeField) -> Self {
         match (ptf.is_batch(), ptf.is_write()) {
             (false, false) => SerialPacketType::Read,
-            (false, true) => SerialPacketType::Write,
             (true, false) => {
                 SerialPacketType::BatchRead(PacketDataLen::new(ptf.datalen()).unwrap())
             }
-            (true, true) => {
-                SerialPacketType::BatchWrite(PacketDataLen::new(ptf.datalen()).unwrap())
+            (false, true) | (true, true) => {
+                SerialPacketType::Write(PacketDataLen::new(ptf.datalen()).unwrap())
             }
         }
     }
@@ -114,16 +111,15 @@ impl SerialPacketType {
     /// Get an equivalent u8 for the Enumeration value
     pub fn u8(&self) -> u8 {
         match self {
-            SerialPacketType::Write => 0b1000_0000,
             SerialPacketType::Read => 0,
-            SerialPacketType::BatchRead(datalen) => 0b0100_0000 | ((datalen.u8() & 0xf) << 2),
-            SerialPacketType::BatchWrite(datalen) => 0b1100_0000 | ((datalen.u8() & 0xf) << 2),
+            SerialPacketType::BatchRead(datalen) => 0b0100_0000 | (datalen.u8() - 4),
+            SerialPacketType::Write(datalen) => 0b1100_0000 | (datalen.u8() - 4),
         }
     }
 }
 
 /// Packet Type Field
-#[derive(Debug, Copy, Clone, Format)]
+#[derive(Debug, Copy, Clone, Format, PartialEq)]
 pub struct SerialPacketTypeField(u8);
 
 impl SerialPacketTypeField {
@@ -140,21 +136,22 @@ impl SerialPacketTypeField {
         match self.0 & 0b1100_0000 {
             // read request, no data
             0b0000_0000 => 0,
-            // write request, no batch, dl = 4
-            0b1000_0000 => 4,
-            // read/write batch request, 4 * data len
-            0b0100_0000 | 0b1100_0000 => 4 * ((self.0 & 0x3c) >> 2),
+            // others, 4 * (data len + 1 bit)
+            0b0100_0000 | 0b1100_0000 | 0b1000_0000 => 4 * (((self.0 & 0x3c) + 4) >> 2),
             _ => panic!(), // will never be reached
         }
     }
 }
 
-impl PartialEq<SerialPacketTypeField> for SerialPacketTypeField {
-    /// PartialEq implemented so ignored fields are not used in comparisons
-    fn eq(&self, other: &SerialPacketTypeField) -> bool {
-        other.is_write() == self.is_write()
-            && other.is_batch() == self.is_batch()
-            && other.datalen() == self.datalen()
+impl From<u8> for SerialPacketTypeField {
+    fn from(byte: u8) -> Self {
+        SerialPacketTypeField(byte & 0b1111_1100)
+    }
+}
+
+impl From<SerialPacketType> for SerialPacketTypeField {
+    fn from(ty: SerialPacketType) -> Self {
+        SerialPacketTypeField(ty.u8())
     }
 }
 
@@ -171,7 +168,7 @@ impl SerialNetworkPacket {
     /// an empty packet
     pub fn empty() -> Self {
         SerialNetworkPacket {
-            pt: SerialPacketTypeField(0),
+            pt: SerialPacketTypeField::from(SerialPacketType::Read),
             address: 0,
             checksum: 0,
             data: [0; 64],
@@ -187,7 +184,7 @@ impl SerialNetworkPacket {
         };
         // calculate the checksum
         let mut pkt = SerialNetworkPacket {
-            pt: SerialPacketTypeField(ty.u8()),
+            pt: SerialPacketTypeField::from(ty),
             address,
             checksum: 0,
             data: [0; 64],
@@ -200,15 +197,13 @@ impl SerialNetworkPacket {
     pub fn new_write(address: u8, data: &[u8]) -> Result<Self, SerialPacketError> {
         let ty = if data.is_empty() {
             return Err(SerialPacketError::WritePacketEmptyData);
-        } else if data.len() == 4 {
-            SerialPacketType::Write
         } else {
-            SerialPacketType::BatchRead(PacketDataLen::try_from(data.len())?)
+            SerialPacketType::Write(PacketDataLen::try_from(data.len())?)
         };
         let mut buf = [0; 64];
         buf[0..data.len()].clone_from_slice(data);
         let mut pkt = SerialNetworkPacket {
-            pt: SerialPacketTypeField(ty.u8()),
+            pt: SerialPacketTypeField::from(ty),
             address,
             checksum: 0,
             data: buf,
@@ -235,29 +230,36 @@ impl SerialNetworkPacket {
     }
 }
 
-pub struct PacketStream {
+/// Implements a parser on a stream of bytes
+#[derive(Debug, Format)]
+pub struct PacketByteStreamHandler {
     parser: PacketParser,
-    packet: SerialNetworkPacket,
+    packet_buffer: SerialNetworkPacket,
 }
 
-impl PacketStream {
+impl PacketByteStreamHandler {
+    /// Create a new handler
     pub fn new() -> Self {
-        PacketStream {
+        PacketByteStreamHandler {
             parser: PacketParser::new(),
-            packet: SerialNetworkPacket::empty(),
+            packet_buffer: SerialNetworkPacket::empty(),
         }
     }
 
+    /// Called on each incoming byte
+    /// If a complete packet has been received, the checksum is checked.
+    /// On a good checksum, the method returns a copy of the packet, on a
+    /// bad checksum, returns an error. If no complete packet, returns None
     pub fn feed(&mut self, byte: u8) -> Result<Option<SerialNetworkPacket>, SerialPacketError> {
         self.parser = self
             .parser
             .clone()
-            .parse_received_byte(byte, &mut self.packet);
+            .parse_received_byte(byte, &mut self.packet_buffer);
         if self.parser.have_complete_packet().is_some() {
             // parser found complete packet
-            let pkt = self.packet;
+            let pkt = self.packet_buffer;
             // reset input packet
-            self.packet = SerialNetworkPacket::empty();
+            self.packet_buffer = SerialNetworkPacket::empty();
             // switch based on checksum of received packet
             if pkt.compare_checksum() {
                 Ok(Some(pkt))
@@ -297,53 +299,23 @@ mod tests {
     fn serial_packet_type() {
         let rd = SerialPacketType::Read;
         assert_eq!(
-            SerialPacketType::from(SerialPacketTypeField(0)).u8(),
+            SerialPacketType::from(SerialPacketTypeField::from(0)).u8(),
             rd.u8()
         );
-        let wr = SerialPacketType::Write;
+        let wr = SerialPacketType::Write(PacketDataLen(4));
         assert_eq!(
-            SerialPacketType::from(SerialPacketTypeField(0b1000_0000)).u8(),
+            SerialPacketType::from(SerialPacketTypeField::from(0b1000_0000)).u8(),
             wr.u8()
         );
         let rdb = SerialPacketType::BatchRead(PacketDataLen(4));
         assert_eq!(
-            SerialPacketType::from(SerialPacketTypeField(0b0100_0100)).u8(),
+            SerialPacketType::from(SerialPacketTypeField::from(0b0100_0000)).u8(),
             rdb.u8()
         );
-        let wrdb = SerialPacketType::BatchWrite(PacketDataLen(64));
-        assert_eq!(
-            SerialPacketType::from(SerialPacketTypeField(0b1110_0000)).u8(),
-            wrdb.u8()
-        );
-    }
-
-    #[test]
-    fn serial_packet_type_field_partialeq() {
-        // using unchecked bits
-        assert_eq!(
-            SerialPacketTypeField(0b0000_0001),
-            SerialPacketTypeField(0b0000_0000)
-        );
-        // using unchecked bits
-        assert_eq!(
-            SerialPacketTypeField(0b0000_0011),
-            SerialPacketTypeField(0b0000_0000)
-        );
-        // read request doesn't check datalen
-        assert_eq!(
-            SerialPacketTypeField(0b0011_0000),
-            SerialPacketTypeField(0b0000_0000)
-        );
-        // batchread matches
-        assert_eq!(
-            SerialPacketTypeField(0b0100_1000),
-            SerialPacketTypeField(0b0100_1000)
-        );
-        // using unchecked bits
-        assert_eq!(
-            SerialPacketTypeField(0b1011_0000),
-            SerialPacketTypeField(0b1011_0011)
-        );
+        let wrdb = SerialPacketType::Write(PacketDataLen(64));
+        let wrfd = SerialPacketTypeField::from(0b1111_1100);
+        assert_eq!(wrfd.datalen(), 64);
+        assert_eq!(SerialPacketType::from(wrfd), wrdb);
     }
 
     #[test]
@@ -384,7 +356,7 @@ mod tests {
             panic!();
         }
         assert!(!pkt.pt.is_write() && pkt.pt.is_batch());
-        assert_eq!(pkt.pt.datalen(), 24);
+        assert_eq!(pkt.pt.datalen(), 28);
         assert_eq!(pkt.address, 0x45);
         assert_eq!(pkt.checksum, 0x01EE);
         assert!(pkt.compare_checksum());
@@ -435,7 +407,7 @@ mod tests {
             b's',
             b'n',
             b'p',
-            0b1100_1000,
+            0b1100_0100,
             0x03,
             0xAB,
             0xCD,
@@ -446,7 +418,7 @@ mod tests {
             0xEF,
             0x12,
             0x07,
-            0x0E,
+            0x0A,
         ];
         let mut pkt = SerialNetworkPacket::empty();
         let mut parser = PacketParser::new();
@@ -459,7 +431,7 @@ mod tests {
         if parser.have_complete_packet().is_none() {
             panic!();
         }
-        assert_eq!(pkt.pt.0, 0b1100_1000);
+        assert_eq!(pkt.pt.0, 0b1100_0100);
         assert_eq!(pkt.address, 0x03);
         assert_eq!(pkt.data[0], 0xAB);
         assert_eq!(pkt.data[1], 0xCD);
@@ -469,8 +441,8 @@ mod tests {
         assert_eq!(pkt.data[5], 0xCD);
         assert_eq!(pkt.data[6], 0xEF);
         assert_eq!(pkt.data[7], 0x12);
-        assert_eq!(pkt.checksum, 0x070E);
-        assert!(pkt.compare_checksum());
+        assert_eq!(pkt.checksum, 0x070A);
+        assert_eq!(pkt.checksum, pkt.compute_checksum());
     }
 
     #[test]

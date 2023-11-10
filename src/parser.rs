@@ -81,7 +81,7 @@ impl Wait {
 impl PacketType {
     pub fn on_advance(self, input: Advance) -> Address {
         Address {
-            ty: SerialPacketTypeField(input.ch),
+            ty: SerialPacketTypeField::from(input.ch),
         }
     }
 }
