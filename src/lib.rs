@@ -40,6 +40,7 @@ extern crate machine;
 mod parser;
 
 use core::convert::TryFrom;
+use core::ops::RangeInclusive;
 use defmt::Format;
 use parser::PacketParser;
 
@@ -77,7 +78,7 @@ impl TryFrom<usize> for PacketDataLen {
     type Error = SerialPacketError;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
-        if value >= 4 && value <= 64 {
+        if RangeInclusive::new(4, 64).contains(&value) {
             Ok(Self(value as u8))
         } else {
             Err(SerialPacketError::DataLen(value))
@@ -216,11 +217,8 @@ impl SerialNetworkPacket {
     pub fn compute_checksum(&self) -> u16 {
         let pt: u16 = self.pt.0.into();
         let addr: u16 = self.address.into();
-        let mut sum: u16 = 0x0073 + 0x006E + 0x0070 + pt + addr;
-        for byte in self.data.iter() {
-            let b16: u16 = (*byte).into();
-            sum += b16;
-        }
+        let mut sum: u16 = b's' as u16 + b'n' as u16 + b'p' as u16 + pt + addr;
+        sum += self.data.iter().map(|b| *b as u16).sum::<u16>();
         sum
     }
 
